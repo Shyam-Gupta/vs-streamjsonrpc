@@ -11,6 +11,7 @@ namespace StreamJsonRpc
     using System.IO;
     using System.Linq;
     using System.Reflection;
+    using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft;
@@ -460,6 +461,11 @@ namespace StreamJsonRpc
                 throw new ArgumentException(Resources.BothReadableWritableAreNull);
             }
 
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.AttachStreamsAndStartListeningStart(sendingStream.GetType().FullName, receivingStream.GetType().FullName);
+            }
+
             var rpc = new JsonRpc(sendingStream, receivingStream, target);
             try
             {
@@ -474,6 +480,13 @@ namespace StreamJsonRpc
             {
                 rpc.Dispose();
                 throw;
+            }
+            finally
+            {
+               if (JsonRpcEventSource.Instance.IsEnabled())
+                {
+                    JsonRpcEventSource.Instance.AttachStreamsAndStartListeningStop(sendingStream.GetType().FullName, receivingStream.GetType().FullName);
+                }
             }
         }
 
@@ -507,10 +520,23 @@ namespace StreamJsonRpc
         public static T Attach<T>(Stream sendingStream, Stream receivingStream)
             where T : class
         {
+            string typeName = typeof(T).FullName;
+
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.GenerateProxyUsingStreamsAndStartListeningStart(typeName);
+            }
+
             var proxyType = ProxyGeneration.Get(typeof(T).GetTypeInfo());
             var rpc = new JsonRpc(sendingStream, receivingStream);
             T proxy = (T)Activator.CreateInstance(proxyType.AsType(), rpc, JsonRpcProxyOptions.Default);
             rpc.StartListening();
+
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.GenerateProxyUsingStreamsAndStartListeningStop(typeName);
+            }
+
             return proxy;
         }
 
@@ -544,10 +570,23 @@ namespace StreamJsonRpc
         public static T Attach<T>(IJsonRpcMessageHandler handler, JsonRpcProxyOptions options)
             where T : class
         {
+            string typeFullName = typeof(T).FullName;
+
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.GenerateProxyAndStartListeningStart(typeFullName);
+            }
+
             var proxyType = ProxyGeneration.Get(typeof(T).GetTypeInfo());
             var rpc = new JsonRpc(handler);
             T proxy = (T)Activator.CreateInstance(proxyType.AsType(), rpc, options ?? JsonRpcProxyOptions.Default);
             rpc.StartListening();
+
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.GenerateProxyAndStartListeningStop(typeFullName);
+            }
+
             return proxy;
         }
 
@@ -571,8 +610,20 @@ namespace StreamJsonRpc
         public T Attach<T>(JsonRpcProxyOptions options)
             where T : class
         {
+            string typeFullName = typeof(T).FullName;
+
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.GenerateProxyStart(typeFullName);
+            }
+
             var proxyType = ProxyGeneration.Get(typeof(T).GetTypeInfo());
             T proxy = (T)Activator.CreateInstance(proxyType.AsType(), this, options ?? JsonRpcProxyOptions.Default);
+
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                JsonRpcEventSource.Instance.GenerateProxyStop(typeFullName);
+            }
 
             return proxy;
         }
@@ -1102,6 +1153,22 @@ namespace StreamJsonRpc
                 request.Arguments = arguments ?? EmptyObjectArray;
             }
 
+            string idStr = id.HasValue ? id.Value.ToString() : "null";
+            string argumentsString = string.Empty;
+            if (JsonRpcEventSource.Instance.IsEnabled())
+            {
+                argumentsString = this.GetArgumentsString(arguments);
+
+                if (request.IsResponseExpected)
+                {
+                    JsonRpcEventSource.Instance.InvokeRpcMethodStart(idStr, targetName, argumentsString, isParameterObject);
+                }
+                else
+                {
+                    JsonRpcEventSource.Instance.InvokeRpcMethodFireAndForget(idStr, targetName, argumentsString, isParameterObject);
+                }
+            }
+
             try
             {
                 using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, this.DisconnectedToken))
@@ -1121,6 +1188,10 @@ namespace StreamJsonRpc
                             this.resultDispatcherMap.Remove(id.Value);
                         }
 
+                        bool connectionLost = false;
+                        bool errorOccurred = false;
+                        bool requestSuccessful = false;
+
                         try
                         {
                             if (response == null)
@@ -1139,26 +1210,38 @@ namespace StreamJsonRpc
                                 {
                                     tcs.TrySetException(new ConnectionLostException());
                                 }
+
+                                connectionLost = true;
                             }
                             else if (response is JsonRpcError error)
                             {
                                 if (error.Error?.Code == JsonRpcErrorCode.RequestCanceled)
                                 {
                                     tcs.TrySetCanceled(cancellationToken.IsCancellationRequested ? cancellationToken : CancellationToken.None);
+                                    connectionLost = true;
                                 }
                                 else
                                 {
                                     tcs.TrySetException(CreateExceptionFromRpcError(error, targetName));
+                                    errorOccurred = true;
                                 }
                             }
                             else if (response is JsonRpcResult result)
                             {
                                 tcs.TrySetResult(result.GetResult<TResult>());
+                                requestSuccessful = true;
                             }
                         }
                         catch (Exception ex)
                         {
                             tcs.TrySetException(ex);
+                        }
+                        finally
+                        {
+                            if (JsonRpcEventSource.Instance.IsEnabled() && request.IsResponseExpected)
+                            {
+                                JsonRpcEventSource.Instance.InvokeRpcMethodEnd(idStr, targetName, argumentsString, isParameterObject, requestSuccessful, connectionLost, errorOccurred);
+                            }
                         }
                     };
 
@@ -1914,6 +1997,21 @@ namespace StreamJsonRpc
                 pendingRequest.CompletionHandler(null);
             }
         }
+
+        private string GetArgumentsString(IReadOnlyList<object> arguments)
+        {
+            var stringBuilder = new StringBuilder();
+            if (arguments != null && arguments.Count > 0)
+            {
+                for (int i = 0; i < arguments.Count; ++i)
+                {
+                    stringBuilder.AppendLine($"arg{i}: {arguments[i].ToString()}; ");
+                }
+            }
+
+            return stringBuilder.ToString();
+        }
+
 
         /// <summary>
         /// Cancels an individual outbound pending request.
